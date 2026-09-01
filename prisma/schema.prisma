@@ -1,0 +1,881 @@
+// Half-Life — Hack Club YSWS hardware program platform.
+//
+// Postgres is the source of truth for everything transactional. Airtable holds
+// the RSVP funnel and the `YSWS Project Submission` rows the Hack Club payout
+// pipeline reads; it is a sink, never a store.
+//
+// Convention: tables are @@map'd to snake_case, columns stay camelCase.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+// Prisma 7 takes the connection URL from prisma.config.ts (for the CLI) and
+// from the driver adapter passed to PrismaClient (at runtime), not from here.
+datasource db {
+  provider = "postgresql"
+}
+
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+/// The five themed tracks, in program order. A theme's ordinal position is its
+/// design week (PCB = design week 1, build week 6). Do not reorder.
+enum Theme {
+  PCB
+  CAD
+  SYNTH
+  DISPLAYS
+  BREADBOARD_COMPUTER
+}
+
+enum Phase {
+  DESIGN
+  BUILD
+}
+
+/// Lifecycle of one (ThemeProject, Phase).
+enum PhaseStatus {
+  draft
+  in_review
+  update_requested
+  approved
+  rejected
+}
+
+enum ReviewResult {
+  APPROVED
+  RETURNED
+  REJECTED
+}
+
+/// Which pass of the review pipeline a review row belongs to.
+///
+/// v1 runs single-pass: a REVIEWER decides directly and every row is FINAL.
+/// The column exists from day one so turning on a volunteer first pass later
+/// (advisory review that moves no status and no money, then an admin
+/// finalizes) is a routing change rather than a migration.
+enum ReviewPass {
+  FIRST
+  FINAL
+}
+
+/// Where a work session's hours come from.
+///
+/// HACKATIME_TRACKED sessions contribute ZERO to the journal total: their time
+/// already arrives through a HackatimeLink. Without this distinction, someone
+/// who writes firmware, journals "4h on firmware", and links the Hackatime
+/// project is paid for eight hours of work they did once.
+enum HoursSource {
+  MANUAL
+  HACKATIME_TRACKED
+}
+
+enum MediaType {
+  IMAGE
+  VIDEO
+}
+
+/// Ledger entry kinds.
+///
+/// There is deliberately no *_REVERSED twin of any kind. A reversal is a
+/// negative row of the same kind, so `SUM(amount) GROUP BY kind` is correct by
+/// construction. Stasis learned this the hard way: because DESIGN_APPROVED and
+/// DESIGN_APPROVED_REVERSED are separate values, every aggregate over the
+/// ledger has to remember to include the twin, and lib/currency.ts carries a
+/// long comment about the one that forgot and overcounted forever.
+enum LedgerKind {
+  EXCESS_HOURS           // credit minted from hours beyond the tier minimum
+  THEME_COMPLETION_BONUS // flat award for shipping a theme (design + build approved)
+  ADMIN_ADJUSTMENT       // manual grant or clawback, signed
+  REVIEWER_PAYMENT       // compensation for review work
+  SHOP_PURCHASE          // always negative
+  SHOP_REFUND            // always positive, nets a SHOP_PURCHASE
+}
+
+enum ShopItemCategory {
+  PRINTER_UPGRADE
+  CONSUMABLE
+  MISC
+}
+
+enum ShopOrderStatus {
+  PENDING
+  ON_HOLD
+  FULFILLED
+  REJECTED
+  CANCELLED
+}
+
+enum PrinterAwardStatus {
+  QUALIFIED
+  ADDRESS_LOCKED
+  PACKING
+  SHIPPED
+  DELIVERED
+  REVOKED
+}
+
+enum Role {
+  ADMIN
+  REVIEWER
+  FULFILLER // ships shop orders and printers; cannot review or mint credit
+  AUDITOR   // read-only oversight
+}
+
+enum AuditAction {
+  // Participant
+  USER_UPDATE_PROJECT
+  USER_SUBMIT_PHASE
+  USER_UNSUBMIT_PHASE
+  USER_CREATE_SESSION
+  USER_UPDATE_SESSION
+  USER_DELETE_SESSION
+  USER_LINK_HACKATIME
+  USER_UNLINK_HACKATIME
+  USER_PLACE_ORDER
+
+  // Review
+  REVIEW_CLAIM
+  REVIEW_RELEASE
+  REVIEW_APPROVE
+  REVIEW_RETURN
+  REVIEW_REJECT
+  REVIEW_APPROVE_HOURS
+  ADMIN_UNAPPROVE_PHASE
+  ADMIN_REOPEN_PHASE
+
+  // Admin
+  ADMIN_GRANT_ROLE
+  ADMIN_REVOKE_ROLE
+  ADMIN_FLAG_FRAUD
+  ADMIN_UNFLAG_FRAUD
+  ADMIN_GRANT_EXTENSION
+  ADMIN_ADJUST_CREDIT
+  ADMIN_DELETE_PROJECT
+  ADMIN_RESTORE_PROJECT
+  ADMIN_CREATE_SHOP_ITEM
+  ADMIN_UPDATE_SHOP_ITEM
+  ADMIN_RETIRE_SHOP_ITEM
+  ADMIN_FULFILL_ORDER
+  ADMIN_REJECT_ORDER
+  ADMIN_UPDATE_PROGRAM_SETTINGS
+
+  // Printer
+  PRINTER_QUALIFIED
+  PRINTER_STATUS_CHANGE
+  PRINTER_REVOKED
+
+  // Side-effect outcomes, so a silent failure becomes a queryable row
+  AIRTABLE_SYNC_SUCCESS
+  AIRTABLE_SYNC_FAILURE
+  NOTIFICATION_FAILURE
+
+  // System
+  SYSTEM_HACKATIME_SYNC
+  SYSTEM_CLAIM_SWEEP
+  SYSTEM_RSVP_DRAIN
+}
+
+// ─── Identity ────────────────────────────────────────────────────────────────
+
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  emailVerified Boolean  @default(false)
+  image         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Hack Club identity, from HCA
+  slackId            String? @unique
+  slackDisplayName   String?
+  hackatimeUserId    String? @unique
+  /// Raw HCA verification_status. YSWS eligibility is gated on this at submit
+  /// time, not at signup, so people can explore the app before verifying.
+  verificationStatus String?
+
+  bio      String?
+  pronouns String?
+  timezone String?
+
+  /// AES-256-GCM at rest via lib/pii.ts. Only populated when PULL_HCA_PII=true.
+  /// Decrypted server-side at the moment of use (the grant row, a shipping
+  /// label) and never selected into a client payload.
+  encryptedAddressStreet  String?
+  encryptedAddressLine2   String?
+  encryptedAddressCity    String?
+  encryptedAddressState   String?
+  encryptedAddressZip     String?
+  encryptedAddressCountry String?
+  encryptedBirthday       String?
+  encryptedPhone          String?
+
+  joinedProgramAt DateTime?
+  /// While now() is before this, the global submission gate does not apply to
+  /// any of this user's phases. Stasis added per-user and per-project override
+  /// columns after doing manual database surgery for every extension request.
+  submissionExtensionUntil DateTime?
+
+  fraudFlagged Boolean @default(false)
+
+  utmSource  String?
+  signupPage String?
+
+  sessions       Session[]
+  accounts       Account[]
+  roles          UserRole[]
+  themeProjects  ThemeProject[]
+  ledgerEntries  LedgerEntry[]
+  shopOrders     ShopOrder[]
+  shopOrderNotes ShopOrderNote[]    @relation("ShopOrderNoteAuthor")
+  printerAward   PrinterAward?
+  reviewsGiven   SubmissionReview[] @relation("SubmissionReviewer")
+  reviewClaims   ReviewClaim[]      @relation("ReviewClaimant")
+  syncRunLogs    SyncRunLog[]       @relation("SyncRunActor")
+
+  @@index([createdAt])
+  @@map("user")
+}
+
+model Session {
+  id        String   @id
+  expiresAt DateTime
+  token     String   @unique
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  ipAddress String?
+  userAgent String?
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("session")
+}
+
+model Account {
+  id                    String    @id
+  accountId             String
+  providerId            String
+  userId                String
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accessToken           String?
+  refreshToken          String?
+  idToken               String?
+  accessTokenExpiresAt  DateTime?
+  refreshTokenExpiresAt DateTime?
+  scope                 String?
+  password              String?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  /// Without this, a retried OAuth callback can create two rows for the same
+  /// upstream identity, and "find this user's HCA account" becomes
+  /// nondeterministic about which refresh token it picks up.
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@map("account")
+}
+
+model Verification {
+  id         String   @id
+  identifier String
+  value      String
+  expiresAt  DateTime
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([identifier])
+  @@map("verification")
+}
+
+model UserRole {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role      Role
+  grantedAt DateTime @default(now())
+  grantedBy String?
+
+  @@unique([userId, role])
+  @@index([userId])
+  @@map("user_role")
+}
+
+// ─── Program work ────────────────────────────────────────────────────────────
+
+/// The durable unit of participation: one row per (user, theme). Exactly five
+/// per participant.
+///
+/// Deliberately not keyed on week. Weeks are derived from
+/// ProgramSettings.eventStartDate and are advisory, so someone doing the week-3
+/// theme in week 5 lands on the same row they would have in week 3.
+model ThemeProject {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  theme  Theme
+
+  title       String  @default("")
+  description String?
+  /// R2 object key, not a URL. URLs are minted at read time so the bucket or
+  /// CDN can move without rewriting every row.
+  coverImageKey String?
+  githubRepo    String?
+  /// Links to design artifacts (EasyEDA share, Onshape doc, ...). Json because
+  /// nothing queries into it.
+  artifactLinks Json?
+
+  // DESIGN phase
+  designStatus         PhaseStatus @default(draft)
+  designReviewComments String?
+  designReviewedAt     DateTime?
+  designReviewedById   String?
+
+  // BUILD phase
+  buildStatus         PhaseStatus @default(draft)
+  buildReviewComments String?
+  buildReviewedAt     DateTime?
+  buildReviewedById   String?
+
+  /// Funding tier 1-3, assigned by a reviewer at DESIGN approval. The tier's
+  /// dollars are parts money, so it has to be settled before the build starts.
+  tier         Int?
+  /// The grant emitted to the YSWS payout pipeline, in whole USD. Written when
+  /// the design phase is approved and never recomputed on read: the tier table
+  /// can change mid-program, and this is the number someone was actually paid.
+  grantUsd     Int?
+  grantEmittedAt DateTime?
+
+  /// Authoritative approved hours for the BUILD phase, frozen at approval.
+  /// Null means "not finalized yet, compute live". Freezing matters because a
+  /// participant can keep adding sessions after approval; without this their
+  /// credit balance would quietly grow.
+  approvedHours   Float?
+  approvedHoursAt DateTime?
+  /// Credit minted from excess hours, frozen alongside approvedHours so the
+  /// ledger and the UI can never disagree about what was paid.
+  excessCredit    Int?
+
+  /// Per-project deadline override, layered on top of the per-user one.
+  /// Either being in the future opens the gate.
+  submissionExtensionUntil DateTime?
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+  deletedById String?
+
+  workSessions   WorkSession[]
+  hackatimeLinks HackatimeLink[]
+  submissions    PhaseSubmission[]
+  ledgerEntries  LedgerEntry[]
+
+  /// One themed project per theme per person. This makes "five themed
+  /// projects" a schema invariant rather than a convention, which is what lets
+  /// printer qualification be a count of five approved themes instead of a
+  /// rule someone can game by creating three PCB projects.
+  @@unique([userId, theme])
+  @@index([userId])
+  @@index([designStatus])
+  @@index([buildStatus])
+  @@map("theme_project")
+}
+
+model WorkSession {
+  id             String       @id @default(cuid())
+  themeProjectId String
+  themeProject   ThemeProject @relation(fields: [themeProjectId], references: [id], onDelete: Cascade)
+  /// Which phase's hours bucket this feeds. A design session never contributes
+  /// to build hours.
+  phase          Phase
+
+  title   String
+  content String? @db.Text
+
+  hoursClaimed  Float
+  /// What a reviewer accepted. Null means not individually reviewed; the hours
+  /// rollup falls back to hoursClaimed.
+  hoursApproved Float?
+  hoursSource   HoursSource @default(MANUAL)
+
+  /// YYYY-MM-DD in the program timezone, stamped at creation. Stasis added the
+  /// equivalent column mid-event and every pre-existing row is null forever.
+  effectiveDate String?
+  /// Program week at creation time, frozen. Cheap week-bucketed analytics
+  /// without recomputing date maths across the table.
+  weekNumber    Int?
+
+  reviewComments String?
+  reviewedAt     DateTime?
+  reviewedById   String?
+
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  media      SessionMedia[]
+  timelapses SessionTimelapse[]
+
+  @@index([themeProjectId, phase])
+  @@index([themeProjectId, createdAt])
+  @@index([effectiveDate])
+  @@map("work_session")
+}
+
+model SessionMedia {
+  id            String      @id @default(cuid())
+  workSessionId String
+  workSession   WorkSession @relation(fields: [workSessionId], references: [id], onDelete: Cascade)
+  type          MediaType
+  objectKey     String
+  contentType   String?
+  byteSize      Int?
+  sortOrder     Int         @default(0)
+  createdAt     DateTime    @default(now())
+
+  @@index([workSessionId])
+  @@map("session_media")
+}
+
+/// Timelapse video attached to a session.
+///
+/// This is evidence, not a third hours bucket. Its duration is never added to
+/// any total; it is divided by the claimed time to give the reviewer a coverage
+/// ratio, so a session claiming six hours with five hours of timelapse reads
+/// very differently from one with none.
+model SessionTimelapse {
+  id            String      @id @default(cuid())
+  workSessionId String
+  workSession   WorkSession @relation(fields: [workSessionId], references: [id], onDelete: Cascade)
+
+  provider     String  @default("r2")
+  objectKey    String?
+  playbackUrl  String?
+  thumbnailUrl String?
+  /// Wall-clock seconds the timelapse REPRESENTS. A 30x timelapse of two hours
+  /// is 7200 here, not 240.
+  coveredSeconds Int?
+  /// The video's own runtime, kept separate so a mistyped speedup factor is
+  /// diagnosable instead of silently inflating coverage.
+  runtimeSeconds Int?
+  speedupFactor  Float?
+
+  createdAt DateTime @default(now())
+
+  @@index([workSessionId])
+  @@map("session_timelapse")
+}
+
+/// A linked Hackatime project, scoped to one themed project and phase.
+/// Firmware for the Synth is a different link from firmware for the Breadboard
+/// Computer, so this is per-project rather than per-user.
+model HackatimeLink {
+  id               String       @id @default(cuid())
+  themeProjectId   String
+  themeProject     ThemeProject @relation(fields: [themeProjectId], references: [id], onDelete: Cascade)
+  hackatimeProject String
+  phase            Phase        @default(BUILD)
+
+  /// Reviewer override. Non-null replaces the live value permanently.
+  hoursApproved Float?
+  reviewedAt    DateTime?
+  reviewedById  String?
+
+  /// Last successful fetch. Stasis's Hackatime client returns 0 on any error
+  /// including a timeout, and that zero flows straight into the hours number on
+  /// the grant row with no trace. Caching the last good value and recording the
+  /// error makes the degraded path both closer to correct and visible.
+  cachedSeconds  Int?
+  cachedAt       DateTime?
+  lastFetchError String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([themeProjectId, hackatimeProject])
+  @@index([themeProjectId, phase])
+  @@map("hackatime_link")
+}
+
+// ─── Review ──────────────────────────────────────────────────────────────────
+
+/// One row per submit attempt for a (ThemeProject, Phase). Resubmitting after
+/// an update_requested creates a new row; the old one stays as history.
+model PhaseSubmission {
+  id             String       @id @default(cuid())
+  themeProjectId String
+  themeProject   ThemeProject @relation(fields: [themeProjectId], references: [id], onDelete: Cascade)
+  phase          Phase
+
+  notes String? @db.Text
+
+  /// Frozen at submit time. Together with the theme's scheduled week this
+  /// answers "did they do week 3's theme in week 5". Analytics only — no gate
+  /// reads these.
+  submittedInWeek Int?
+  scheduledWeek   Int?
+  onTime          Boolean @default(false)
+
+  /// Set by an advisory first-pass review. Unused while v1 runs single-pass.
+  preReviewed   Boolean   @default(false)
+  preReviewedAt DateTime?
+
+  /// Non-null means this submission is resolved and immutable.
+  resolvedAt     DateTime?
+  resolvedResult ReviewResult?
+
+  createdAt DateTime @default(now())
+
+  reviews SubmissionReview[]
+  claim   ReviewClaim?
+
+  @@index([themeProjectId])
+  @@index([themeProjectId, phase, createdAt(sort: Desc)])
+  /// The review queue's hot path: unresolved submissions, oldest first.
+  @@index([resolvedAt, createdAt])
+  @@map("phase_submission")
+}
+
+/// Exclusive, expiring lock held while a reviewer works on a submission.
+///
+/// submissionId is unique, so claiming is a single insert that either succeeds
+/// or throws a unique violation. Never implement this as read-then-write.
+model ReviewClaim {
+  id           String          @id @default(cuid())
+  submissionId String          @unique
+  submission   PhaseSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  reviewerId   String
+  reviewer     User            @relation("ReviewClaimant", fields: [reviewerId], references: [id], onDelete: Cascade)
+  expiresAt    DateTime
+  createdAt    DateTime        @default(now())
+
+  @@index([reviewerId])
+  @@index([expiresAt])
+  @@map("review_claim")
+}
+
+model SubmissionReview {
+  id           String          @id @default(cuid())
+  submissionId String
+  submission   PhaseSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  reviewerId   String
+  reviewer     User            @relation("SubmissionReviewer", fields: [reviewerId], references: [id], onDelete: Restrict)
+
+  pass   ReviewPass   @default(FINAL)
+  result ReviewResult
+
+  /// Shown to the submitter.
+  feedback String  @db.Text
+  /// Internal justification, never shown to the submitter. This is what feeds
+  /// the hours justification on the grant row.
+  reason   String? @db.Text
+
+  /// Set when a later action supersedes this review (an un-approval). Keeps the
+  /// history intact without letting a stale row drive computations.
+  invalidated   Boolean   @default(false)
+  invalidatedAt DateTime?
+
+  // What the reviewer explicitly overrode; null means they took the default.
+  hoursOverride    Float?
+  tierOverride     Int?
+  grantUsdOverride Int?
+
+  /// Snapshot of everything the reviewer was looking at, written
+  /// unconditionally. The tier table is expected to change mid-program, so
+  /// without frozenGrantUsd there is no way to reconstruct why someone was paid
+  /// what they were paid.
+  frozenJournalHours     Float?
+  frozenHackatimeHours   Float?
+  frozenTimelapseSeconds Int?
+  frozenEntryCount       Int?
+  frozenApprovedHours    Float?
+  frozenTier             Int?
+  frozenGrantUsd         Int?
+  frozenExcessCredit     Int?
+
+  createdAt DateTime @default(now())
+
+  @@index([submissionId])
+  @@index([reviewerId, createdAt])
+  @@map("submission_review")
+}
+
+// ─── Economy ─────────────────────────────────────────────────────────────────
+
+/// Append-only credit ledger. Rows are never updated or deleted.
+///
+/// Invariant: for a given (userId, themeProjectId, kind) the SUM of amounts
+/// equals the current target for that grant. Re-review appends a delta row
+/// rather than a second full grant, which is what makes approving the same
+/// project five times converge instead of compound. See lib/currency.ts.
+model LedgerEntry {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Null for account-level entries (admin adjustment, reviewer pay, shop).
+  themeProjectId String?
+  themeProject   ThemeProject? @relation(fields: [themeProjectId], references: [id], onDelete: SetNull)
+
+  kind   LedgerKind
+  /// Signed. Positive credits, negative debits.
+  amount Int
+
+  note String?
+
+  /// Captured at write time as an audit aid only. The authoritative balance is
+  /// always SUM(amount) — if these ever disagree, a write escaped the
+  /// transaction wrapper and you want to find out.
+  balanceBefore Int
+  balanceAfter  Int
+
+  shopOrderId String?
+  shopOrder   ShopOrder? @relation(fields: [shopOrderId], references: [id], onDelete: SetNull)
+
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  @@index([userId, createdAt])
+  /// The reconcile aggregate must be a single index scan.
+  @@index([userId, themeProjectId, kind])
+  /// At most one purchase row and one refund row per order. Postgres treats
+  /// nulls as distinct, so account-level rows are unaffected. This is what
+  /// stops a double-submitted purchase form from charging twice.
+  @@unique([shopOrderId, kind])
+  @@map("ledger_entry")
+}
+
+model ShopItem {
+  /// Hand-assigned slug, not a cuid: it appears in config and analytics and has
+  /// to survive a rename.
+  id              String           @id
+  name            String
+  description     String
+  imageUrl        String?
+  category        ShopItemCategory @default(PRINTER_UPGRADE)
+
+  priceCredits Int
+  /// 0 means unlimited.
+  maxPerUser   Int  @default(1)
+  /// Null means unlimited.
+  stock        Int?
+
+  /// Most items bolt onto the printer, so buying one without qualifying for the
+  /// printer is meaningless.
+  requiresPrinterQualified Boolean @default(true)
+
+  active    Boolean  @default(true)
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orders ShopOrder[]
+
+  @@index([active, sortOrder])
+  @@map("shop_item")
+}
+
+model ShopOrder {
+  id          String @id @default(cuid())
+  orderNumber Int    @unique @default(autoincrement())
+
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  shopItemId String
+  shopItem   ShopItem @relation(fields: [shopItemId], references: [id], onDelete: Restrict)
+
+  quantity      Int
+  unitCredits   Int
+  totalCredits  Int
+  /// The catalogue changes; order history must not.
+  itemNameSnapshot String
+
+  status          ShopOrderStatus @default(PENDING)
+  holdReason      String?
+  rejectionReason String?
+
+  /// Encrypted JSON snapshot of the address at order time.
+  encryptedAddress String @default("")
+  encryptedPhone   String @default("")
+
+  trackingNumber  String?
+  trackingCarrier String?
+
+  placedAt    DateTime  @default(now())
+  heldAt      DateTime?
+  rejectedAt  DateTime?
+  fulfilledAt DateTime?
+  lastActorId String?
+
+  notes         ShopOrderNote[]
+  ledgerEntries LedgerEntry[]
+
+  @@index([userId])
+  @@index([status, placedAt])
+  @@index([shopItemId])
+  @@map("shop_order")
+}
+
+model ShopOrderNote {
+  id        String    @id @default(cuid())
+  orderId   String
+  order     ShopOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  authorId  String
+  author    User      @relation("ShopOrderNoteAuthor", fields: [authorId], references: [id], onDelete: Restrict)
+  body      String    @db.Text
+  createdAt DateTime  @default(now())
+
+  @@index([orderId])
+  @@map("shop_order_note")
+}
+
+/// The 3D printer prize.
+///
+/// This is a fulfilment record, not an eligibility record: eligibility is always
+/// recomputed from ThemeProject state. Keeping them separate means an
+/// un-approval after the fact surfaces as a mismatch an admin resolves, rather
+/// than silently revoking a printer that is already in a box.
+model PrinterAward {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  qualifiedAt DateTime
+  /// Snapshot of the five themes and their approval timestamps, so a later
+  /// un-approval does not erase the evidence.
+  qualifyingSnapshot Json
+
+  status PrinterAwardStatus @default(QUALIFIED)
+
+  encryptedAddress String    @default("")
+  encryptedPhone   String    @default("")
+  addressLockedAt  DateTime?
+
+  trackingNumber  String?
+  trackingCarrier String?
+  shippedAt       DateTime?
+  deliveredAt     DateTime?
+
+  revokedAt     DateTime?
+  revokedReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@map("printer_award")
+}
+
+// ─── Ops ─────────────────────────────────────────────────────────────────────
+
+/// Singleton row of live program settings.
+///
+/// Deliberately not env vars. Stasis put its submission gate in
+/// SUBMISSIONS_CLOSED and lib/event.ts records the outcome verbatim: the var
+/// "was never flipped in Coolify and submissions silently stayed open for two
+/// weeks". A database row with an admin toggle and an audit trail cannot be
+/// forgotten in a dashboard. The env vars survive only as seed defaults.
+model ProgramSettings {
+  id String @id @default("singleton")
+
+  /// Week 1, day 1, midnight in programTimezone. All week maths derives from it.
+  eventStartDate  DateTime
+  programTimezone String   @default("America/New_York")
+
+  submissionsOpen    Boolean   @default(true)
+  submissionsCloseAt DateTime?
+
+  shopOpen      Boolean   @default(false)
+  shopClosesAt  DateTime?
+  /// The shop stays open this many days past a participant's last review, so
+  /// credit awarded at the buzzer is actually spendable.
+  shopGraceDays Int       @default(7)
+
+  reviewClaimTtlMinutes Int @default(45)
+
+  /// Kill switch for the outbound Airtable writer, without a redeploy.
+  airtableSyncEnabled Boolean @default(true)
+
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+
+  @@map("program_settings")
+}
+
+model AuditLog {
+  id             String      @id @default(cuid())
+  action         AuditAction
+  actorId        String?
+  actorEmail     String?
+  actorIp        String?
+  actorUserAgent String?
+  targetType     String?
+  targetId       String?
+  /// Records the before and after value of anything that changed. Knowing that
+  /// something happened is much less useful six weeks later than knowing what
+  /// it changed from and to.
+  metadata       Json?
+  createdAt      DateTime    @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([action, createdAt])
+  @@index([targetId])
+  @@index([createdAt])
+  @@map("audit_log")
+}
+
+/// One row per successful sync run, so admin surfaces can show "last synced N
+/// minutes ago" and tell a cron run apart from a human pressing a button.
+/// Failures go to AuditLog, so a timestamp here always means a real round trip.
+model SyncRunLog {
+  id        String   @id @default(cuid())
+  syncKey   String
+  result    Json?
+  actorId   String?
+  actor     User?    @relation("SyncRunActor", fields: [actorId], references: [id], onDelete: SetNull)
+  createdAt DateTime @default(now())
+
+  @@index([syncKey, createdAt])
+  @@map("sync_run_log")
+}
+
+/// RSVP write-behind buffer.
+///
+/// Airtable is the funnel's source of truth but it rate-limits and it goes
+/// down. Every RSVP is written here first and drained to Airtable by a job, so
+/// a marketing-page signup never fails because a third party is having a bad
+/// day. Stasis writes through to Airtable synchronously and only falls back to
+/// Postgres when someone flips an env var by hand.
+model RsvpBuffer {
+  id    String @id @default(cuid())
+  email String @unique
+
+  firstName String?
+  lastName  String?
+  pronouns  String?
+
+  ip         String?
+  utmSource  String?
+  signupPage String?
+  referredBy String?
+
+  finishedAccountCreation Boolean @default(false)
+  userId                  String?
+
+  syncedToAirtable Boolean   @default(false)
+  syncedAt         DateTime?
+  syncAttempts     Int       @default(0)
+  lastSyncError    String?
+  /// Set once the row exists upstream, so later updates are a patch by id
+  /// rather than a formula search.
+  airtableRecordId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// The drain job's hot path.
+  @@index([syncedToAirtable, syncAttempts, createdAt])
+  @@map("rsvp_buffer")
+}

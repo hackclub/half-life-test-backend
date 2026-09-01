@@ -1,0 +1,174 @@
+import { notFound } from "next/navigation"
+import { requirePermissionPage } from "@/lib/page-guards"
+import { hasPermission, Permission } from "@/lib/permissions"
+import { getUserDetail } from "@/lib/queries/admin"
+import { getThemeDef } from "@/lib/config/program"
+import { CREDIT_NAME_PLURAL } from "@/lib/config/program"
+import {
+  Badge,
+  EmptyState,
+  PageHeader,
+  Panel,
+  Stat,
+  Table,
+  statusLabel,
+  statusTone,
+} from "@/app/components/ui"
+import { RoleEditor } from "@/app/components/forms/RoleEditor"
+import { CreditGrantForm } from "@/app/components/forms/CreditGrantForm"
+import { ActionButton } from "@/app/components/forms/ActionButton"
+
+export const dynamic = "force-dynamic"
+
+type Props = { params: Promise<{ id: string }> }
+
+export default async function AdminUserPage({ params }: Props) {
+  const { roles } = await requirePermissionPage(Permission.VIEW_USERS)
+  const { id } = await params
+
+  const detail = await getUserDetail(id)
+  if (!detail) notFound()
+
+  const { user, balance, ledger, orders, printer } = detail
+  const canManageRoles = hasPermission(roles, Permission.MANAGE_ROLES)
+  const canManageCredit = hasPermission(roles, Permission.MANAGE_CREDIT)
+  const canManageUsers = hasPermission(roles, Permission.MANAGE_USERS)
+  const canOverride = hasPermission(roles, Permission.OVERRIDE_DECISIONS)
+
+  return (
+    <div className="hl-stack">
+      <PageHeader
+        title={user.name ?? user.email}
+        subtitle={user.email}
+        actions={
+          user.fraudFlagged ? <Badge tone="danger">flagged</Badge> : null
+        }
+      />
+
+      <div className="hl-row">
+        <Stat label={`${CREDIT_NAME_PLURAL} balance`} value={balance} />
+        <Stat label="Themes shipped" value={`${printer.shippedCount} / ${printer.required}`} />
+        <Stat label="Verified" value={user.verificationStatus ?? "unknown"} />
+      </div>
+
+      {canManageUsers ? (
+        <Panel title="Moderation">
+          <div className="hl-row">
+            <ActionButton
+              url={`/api/admin/users/${id}`}
+              method="PATCH"
+              body={{ fraudFlagged: !user.fraudFlagged }}
+              label={user.fraudFlagged ? "Clear the flag" : "Flag this account"}
+              variant={user.fraudFlagged ? "default" : "danger"}
+              confirm={
+                user.fraudFlagged
+                  ? "Let this account submit again?"
+                  : "Flagging blocks all submissions. Continue?"
+              }
+            />
+          </div>
+        </Panel>
+      ) : null}
+
+      {canManageRoles ? (
+        <Panel title="Roles">
+          <RoleEditor userId={id} current={user.roles.map((r) => r.role)} />
+        </Panel>
+      ) : null}
+
+      <Panel title="Themed projects">
+        <Table head={["Theme", "Design", "Build", "Tier", "Grant", "Hours", canOverride ? "" : null].filter(Boolean)}>
+          {user.themeProjects.map((project) => (
+            <tr key={project.id}>
+              <td>{getThemeDef(project.theme).label}</td>
+              <td>
+                <Badge tone={statusTone(project.designStatus)}>
+                  {statusLabel(project.designStatus)}
+                </Badge>
+              </td>
+              <td>
+                <Badge tone={statusTone(project.buildStatus)}>
+                  {statusLabel(project.buildStatus)}
+                </Badge>
+              </td>
+              <td>{project.tier ?? "—"}</td>
+              <td>{project.grantUsd !== null ? `$${project.grantUsd}` : "—"}</td>
+              <td className="hl-mono">{project.approvedHours ?? "—"}</td>
+              {canOverride ? (
+                <td>
+                  {project.designStatus === "approved" ? (
+                    <ActionButton
+                      url={`/api/admin/theme-projects/${project.id}/override`}
+                      body={{
+                        action: "unapprove",
+                        phase: "DESIGN",
+                        reason: "Un-approved by an admin",
+                      }}
+                      label="Un-approve design"
+                      confirm="Un-approve the design? This clears the tier and grant."
+                    />
+                  ) : null}
+                  {project.buildStatus === "approved" ? (
+                    <ActionButton
+                      url={`/api/admin/theme-projects/${project.id}/override`}
+                      body={{
+                        action: "unapprove",
+                        phase: "BUILD",
+                        reason: "Un-approved by an admin",
+                      }}
+                      label="Un-approve build"
+                      confirm={`Un-approve the build? This reconciles their ${CREDIT_NAME_PLURAL} back down.`}
+                    />
+                  ) : null}
+                </td>
+              ) : null}
+            </tr>
+          ))}
+        </Table>
+      </Panel>
+
+      {canManageCredit ? (
+        <Panel title="Adjust credit">
+          <CreditGrantForm userId={id} />
+        </Panel>
+      ) : null}
+
+      <Panel title="Ledger">
+        {ledger.length === 0 ? (
+          <EmptyState>No entries.</EmptyState>
+        ) : (
+          <Table head={["When", "Kind", "Note", "Amount", "Balance"]}>
+            {ledger.map((entry) => (
+              <tr key={entry.id}>
+                <td className="hl-mono">{entry.createdAt.toLocaleString()}</td>
+                <td className="hl-mono">{entry.kind}</td>
+                <td>{entry.note ?? "—"}</td>
+                <td className="hl-mono">
+                  {entry.amount > 0 ? `+${entry.amount}` : entry.amount}
+                </td>
+                <td className="hl-mono">{entry.balanceAfter}</td>
+              </tr>
+            ))}
+          </Table>
+        )}
+      </Panel>
+
+      <Panel title="Orders">
+        {orders.length === 0 ? (
+          <EmptyState>No orders.</EmptyState>
+        ) : (
+          <Table head={["#", "Item", "Cost", "Status"]}>
+            {orders.map((order) => (
+              <tr key={order.id}>
+                <td className="hl-mono">{order.orderNumber}</td>
+                <td>{order.itemNameSnapshot}</td>
+                <td>{order.totalCredits}</td>
+                <td>{order.status.toLowerCase()}</td>
+              </tr>
+            ))}
+          </Table>
+        )}
+      </Panel>
+    </div>
+  )
+}

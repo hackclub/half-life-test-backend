@@ -1,0 +1,169 @@
+# Orchard runbook
+
+Half-Life deploys to **Orchard**, org **YSWS** (`ysws`). Not Vercel, not
+Coolify.
+
+## One-time setup
+
+1. **Register the OAuth apps before the first deploy.** At
+   `auth.hackclub.com`, redirect URI:
+
+   ```
+   https://<host>/api/auth/callback/hca
+   ```
+
+   and at Hackatime, `https://<host>/api/auth/callback/hackatime`.
+
+   Generic OAuth providers register as first-class social providers in
+   better-auth 1.7, so the callback path is `/api/auth/callback/<providerId>` —
+   **not** an `oauth2`-prefixed one. The URI must match `BETTER_AUTH_URL`
+   exactly: same scheme, no trailing slash.
+
+2. **Confirm GitHub is wired up.** In the Orchard UI at `/user/settings`, check
+   your GitHub account is linked and the Orchard GitHub App is installed on the
+   `hackclub` org. Verify with `list_github_deploy_targets`. If `hackclub` is
+   not listed, `deploy_from_github` fails with a confusing 404 and no amount of
+   retrying helps.
+
+3. **Create the project and database.**
+
+   ```
+   create_project   name: half-life, organizationId: <ysws org uuid>
+   create_database  projectId: <id>, name: half-life-db, storageSize: 10Gi,
+                    cpuRequestMilli: 500, memoryRequestBytes: 1073741824
+   ```
+
+   Note the returned connection string. Storage can be expanded later
+   (`expand_database_storage`); it cannot be shrunk.
+
+4. **Generate secrets** — `openssl rand -base64 32` for each of
+   `BETTER_AUTH_SECRET`, `INTEGRATION_API_KEY`, `EXPORT_API_KEY` and (if you are
+   pulling PII) `PII_ENCRYPTION_KEY`.
+
+5. **Create the R2 bucket**, an API token scoped to it, and a public custom
+   domain. Put that hostname in `NEXT_PUBLIC_UPLOAD_HOST` — `next/image` refuses
+   any host not in `next.config.ts`'s `remotePatterns`, and the failure is a
+   broken image with no console error.
+
+6. **Deploy.**
+
+   ```
+   deploy_from_github  projectId: <id>, name: half-life-web,
+                       githubRepo: hackclub/half-life, branch: main,
+                       buildType: dockerfile, port: 3000,
+                       env: [ ...every var from .env.example... ]
+   ```
+
+   Watch `get_build_logs`. Set `REQUIRE_BASICAUTH=true` plus
+   `BASICAUTH_USERNAME`/`BASICAUTH_PASSWORD` until launch day.
+
+7. **Create the ingress** — `create_ingress` for `half-life.k.hackclub.dev`.
+   Orchard already terminates TLS for that domain, so no `validate_dns` step is
+   needed; a vanity domain later needs `validate_dns` first.
+
+8. **Check health.** `GET https://<host>/api/health` must return `{"ok":true}`.
+   `{"ok":false}` means the database is unreachable or migrations did not run —
+   look for the `[boot]` lines in `get_pod_logs`.
+
+9. **Seed.** `exec_in_pod` → `yarn db:seed`. Idempotent; it creates the settings
+   row and the starter shop items without overwriting anything an admin changed.
+
+10. **Enable auto-deploy** on `main` (`enable_auto_deploy`).
+
+11. **Sign in once** with an address listed in `SUPERADMIN_EMAILS` and confirm
+    `/admin` loads.
+
+12. **Create the jobs** (see below), then `run_job` each one immediately and
+    read `get_job_run_logs`. Do not wait for the first scheduled fire to find a
+    typo in a URL.
+
+13. **Notifications.** `create_notification_channel` (Slack webhook), then two
+    rules: one for `deploy.failed`, `pod.crashing`, `job.failed`,
+    `db.crashing`, `backup.failed`, and a separate quieter one for the success
+    events so it can be muted independently.
+
+14. **Backups.** `set_database_backup_schedule` daily, then
+    `create_database_backup` once by hand to prove a restore works.
+
+## Scheduled jobs
+
+Orchard jobs of `type: "app"` run a command inside the deployment's own image
+with its environment, so `INTEGRATION_API_KEY` is already present and never
+needs duplicating into the job.
+
+| Job | Cron (UTC) | Endpoint |
+|---|---|---|
+| `hackatime-sync` | `*/15 * * * *` | `POST /api/integrations/hackatime-sync` |
+| `airtable-retry` | `17 * * * *` | `POST /api/integrations/airtable-retry` |
+| `rsvp-drain` | `*/10 * * * *` | `POST /api/integrations/rsvp-drain` |
+| `claim-sweep` | `*/5 * * * *` | `POST /api/integrations/claim-sweep` |
+| `printer-reconcile` | `0 8 * * *` | `POST /api/integrations/printer-reconcile` |
+
+Each step:
+
+```jsonc
+{
+  "type": "app",
+  "name": "post",
+  "deploymentId": "<deployment uuid>",
+  "timeoutSeconds": 600,
+  "retries": 2,
+  "command": "curl -fsS --max-time 570 -X POST -H \"Authorization: Bearer $INTEGRATION_API_KEY\" https://<host>/api/integrations/<name>"
+}
+```
+
+Three details that decide whether this works or quietly rots:
+
+- **`curl -f`.** Without it, curl exits 0 on a 500 and the job stays green
+  forever while doing nothing. This is the most common way self-hosted cron goes
+  silent.
+- **`concurrencyPolicy: "forbid"`**, so a slow sync does not stack up behind
+  itself every fifteen minutes.
+- **`--max-time` under `timeoutSeconds`**, and the route's `maxDuration` under
+  that, so a timeout surfaces as a clean curl failure rather than a killed pod.
+
+The jobs hit the public ingress, and `middleware.ts` already excludes
+`/api/integrations` from basic auth — verify that before enabling
+`REQUIRE_BASICAUTH`, or every job goes red at once.
+
+Every one of these routes accepts `?dryRun=true` and returns what it would have
+done without writing. Use it before trusting a schedule.
+
+## Routine operations
+
+**Deploy** — merge to `main`; auto-deploy builds and rolls.
+
+**Roll back** — `rollback_deployment` reverts the *image*, not the *database*. A
+release containing a destructive migration is not rollback-safe. Keep migrations
+additive (add nullable, backfill, drop in a later release) and this never comes
+up.
+
+**Migration failed at boot** — the pod crashloops and `pod.crashing` fires;
+`get_pod_logs` has the Prisma error. Fix forward with a new migration. Restore a
+backup only if data was lost.
+
+**A job went red** — `list_job_runs` → `get_job_run_logs`, then `run_job` by
+hand. Reproduce with `?dryRun=true` first.
+
+**Stop participant writes right now** — flip *Submissions open* off at
+`/admin/program`. It is a database row with an audit trail, deliberately not an
+env var: stasis put this in `SUBMISSIONS_CLOSED`, nobody flipped it in the
+dashboard, and submissions stayed open for two weeks after the event ended.
+Reviews and the shop stay up.
+
+**A grant row never reached Airtable** — `/admin/program` lists them with a
+retry button, and `/admin/audit?action=AIRTABLE_SYNC_FAILURE` has the errors.
+The `airtable-retry` job does the same sweep hourly.
+
+**Scale for a launch spike** — `scale_deployment` to 2–3 replicas; the app is
+stateless and sessions live in Postgres. Stagger the rollout rather than going
+from 0 to 3 at once, so several `prisma migrate deploy` runs are not racing at
+boot (Prisma's advisory lock handles it, but there is no reason to lean on it).
+
+## Local development
+
+`./dev.sh` starts Postgres in Docker, waits on its healthcheck, generates the
+Prisma client, migrates, seeds and runs `next dev`. It is safe to re-run.
+
+The app works with no Airtable, no R2 and no Slack configured — every one of
+those integrations no-ops with a warning when its credentials are missing.

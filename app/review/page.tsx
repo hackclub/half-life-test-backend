@@ -1,0 +1,92 @@
+import Link from "next/link"
+import { requirePermissionPage } from "@/lib/page-guards"
+import { Permission } from "@/lib/permissions"
+import { getReviewQueue } from "@/lib/queries/review"
+import { Phase } from "@/app/generated/prisma/enums"
+import { Badge, EmptyState, PageHeader, Panel, Stat, Table } from "@/app/components/ui"
+
+export const dynamic = "force-dynamic"
+
+type Props = { searchParams: Promise<{ phase?: string; cursor?: string }> }
+
+export default async function ReviewQueuePage({ searchParams }: Props) {
+  await requirePermissionPage(Permission.REVIEW_SUBMISSIONS)
+  const { phase, cursor } = await searchParams
+
+  const selected =
+    phase === "DESIGN" ? Phase.DESIGN : phase === "BUILD" ? Phase.BUILD : undefined
+
+  const queue = await getReviewQueue({ phase: selected, cursor, limit: 50 })
+
+  return (
+    <div className="hl-stack">
+      <PageHeader title="Review queue" subtitle="Oldest submissions first." />
+
+      <div className="hl-row">
+        <Stat label="Design waiting" value={queue.counts.design} />
+        <Stat label="Build waiting" value={queue.counts.build} />
+      </div>
+
+      <div className="hl-row">
+        <Link href="/review" className="hl-btn">
+          All
+        </Link>
+        <Link href="/review?phase=DESIGN" className="hl-btn">
+          Design
+        </Link>
+        <Link href="/review?phase=BUILD" className="hl-btn">
+          Build
+        </Link>
+      </div>
+
+      <Panel>
+        {queue.items.length === 0 ? (
+          <EmptyState>Queue is empty.</EmptyState>
+        ) : (
+          <Table head={["Theme", "Phase", "Participant", "Waiting since", "Claim", ""]}>
+            {queue.items.map((item) => (
+                <tr key={item.id}>
+                  <td>
+                    {item.themeLabel}
+                    <div className="hl-hint">{item.projectTitle}</div>
+                  </td>
+                  <td>
+                    {item.phase.toLowerCase()}
+                    {!item.onTime ? (
+                      <div className="hl-hint">
+                        submitted week {item.submittedInWeek ?? "?"}
+                      </div>
+                    ) : null}
+                  </td>
+                  <td>
+                    {item.participant.name ?? item.participant.email}
+                    <div className="hl-hint">{item.participant.email}</div>
+                  </td>
+                  <td className="hl-mono">{item.submittedAt.toDateString()}</td>
+                  <td>
+                    {item.claimLive ? (
+                      <Badge tone="warning">{item.claimedBy?.name ?? "claimed"}</Badge>
+                    ) : (
+                      <Badge tone="muted">free</Badge>
+                    )}
+                  </td>
+                  <td>
+                    <Link href={`/review/${item.id}`}>Open</Link>
+                  </td>
+                </tr>
+            ))}
+          </Table>
+        )}
+        {queue.nextCursor ? (
+          <p>
+            <Link
+              href={`/review?${selected ? `phase=${selected}&` : ""}cursor=${queue.nextCursor}`}
+            >
+              Next page
+            </Link>
+          </p>
+        ) : null}
+      </Panel>
+    </div>
+  )
+}

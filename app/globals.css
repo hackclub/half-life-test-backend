@@ -1,0 +1,200 @@
+@import "tailwindcss";
+
+/*
+ * The entire design system lives in this file.
+ *
+ * The visual direction for Half-Life is not finished. Everything below is a
+ * deliberately plain placeholder, and the way to restyle the app is to rewrite
+ * this file plus the primitives in app/components/ui/ — no page file contains a
+ * colour, a radius, or a font.
+ */
+
+@theme {
+  --color-surface: #ffffff;
+  --color-surface-raised: #f6f6f7;
+  --color-surface-sunken: #ededf0;
+  --color-border: #d8d8dc;
+  --color-border-strong: #b2b2ba;
+  --color-ink: #17171a;
+  --color-ink-muted: #66666f;
+  --color-accent: #2f5fd0;
+  --color-accent-ink: #ffffff;
+  --color-success: #1a7f45;
+  --color-warning: #8a5a00;
+  --color-danger: #b3261e;
+
+  --radius-control: 4px;
+  --radius-panel: 6px;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  line-height: 1.5;
+  margin: 0;
+}
+
+a {
+  color: var(--color-accent);
+}
+
+@layer components {
+  .hl-shell {
+    max-width: 62rem;
+    margin: 0 auto;
+    padding: 1.5rem 1rem 4rem;
+  }
+  .hl-nav {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    flex-wrap: wrap;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--color-border);
+    background: var(--color-surface-raised);
+  }
+  .hl-panel {
+    background: var(--color-surface-raised);
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-panel);
+    padding: 1rem;
+  }
+  .hl-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+  .hl-stack--tight {
+    gap: 0.5rem;
+  }
+  .hl-row {
+    display: flex;
+    gap: 1rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .hl-grid {
+    display: grid;
+    gap: 1rem;
+    grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr));
+  }
+  .hl-btn {
+    display: inline-block;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-control);
+    background: var(--color-surface);
+    color: var(--color-ink);
+    padding: 0.45rem 0.85rem;
+    font: inherit;
+    cursor: pointer;
+    text-decoration: none;
+  }
+  .hl-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+  .hl-btn--primary {
+    background: var(--color-accent);
+    color: var(--color-accent-ink);
+    border-color: transparent;
+  }
+  .hl-btn--danger {
+    background: var(--color-danger);
+    color: #fff;
+    border-color: transparent;
+  }
+  .hl-input,
+  .hl-select,
+  .hl-textarea {
+    width: 100%;
+    box-sizing: border-box;
+    border: 1px solid var(--color-border-strong);
+    border-radius: var(--radius-control);
+    background: var(--color-surface);
+    color: var(--color-ink);
+    padding: 0.45rem 0.5rem;
+    font: inherit;
+  }
+  .hl-textarea {
+    min-height: 8rem;
+  }
+  .hl-label {
+    display: block;
+    font-size: 0.85rem;
+    font-weight: 600;
+    margin-bottom: 0.25rem;
+  }
+  .hl-hint {
+    color: var(--color-ink-muted);
+    font-size: 0.85rem;
+  }
+  .hl-muted {
+    color: var(--color-ink-muted);
+  }
+  .hl-mono {
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+  }
+  .hl-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  .hl-table th,
+  .hl-table td {
+    border-bottom: 1px solid var(--color-border);
+    padding: 0.5rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  .hl-table th {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--color-ink-muted);
+  }
+  .hl-scroll {
+    overflow-x: auto;
+  }
+  .hl-badge {
+    display: inline-block;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid currentColor;
+    font-size: 0.75rem;
+    white-space: nowrap;
+  }
+  .hl-badge--success { color: var(--color-success); }
+  .hl-badge--warning { color: var(--color-warning); }
+  .hl-badge--danger  { color: var(--color-danger); }
+  .hl-badge--muted   { color: var(--color-ink-muted); }
+  .hl-callout {
+    border-left: 3px solid var(--color-accent);
+    background: var(--color-surface-sunken);
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius-control);
+  }
+  .hl-callout--danger { border-left-color: var(--color-danger); }
+  .hl-callout--warning { border-left-color: var(--color-warning); }
+  .hl-stat {
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-panel);
+    padding: 0.75rem;
+    min-width: 8rem;
+  }
+  .hl-stat-value {
+    font-size: 1.5rem;
+    font-weight: 600;
+  }
+  .hl-stat-label {
+    font-size: 0.8rem;
+    color: var(--color-ink-muted);
+  }
+}
