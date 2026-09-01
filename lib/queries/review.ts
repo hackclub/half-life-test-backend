@@ -24,6 +24,8 @@ export interface QueueItem {
 }
 
 export async function getReviewQueue(opts: {
+  /** The signed-in reviewer. Their own submissions are excluded from the queue. */
+  reviewerId: string
   phase?: Phase
   cursor?: string
   limit: number
@@ -31,7 +33,10 @@ export async function getReviewQueue(opts: {
   const where = {
     resolvedAt: null,
     ...(opts.phase ? { phase: opts.phase } : {}),
-    themeProject: { deletedAt: null },
+    // Nobody reviews their own work, so it should never show up as something
+    // to act on. The decision path refuses it too — this is so the queue
+    // counts are honest, not the enforcement.
+    themeProject: { deletedAt: null, userId: { not: opts.reviewerId } },
   }
 
   const [rows, designCount, buildCount] = await Promise.all([
@@ -85,7 +90,7 @@ export async function getReviewQueue(opts: {
   }
 }
 
-export async function getSubmissionDetail(submissionId: string) {
+export async function getSubmissionDetail(submissionId: string, reviewerId?: string) {
   const submission = await prisma.phaseSubmission.findUnique({
     where: { id: submissionId },
     include: {
@@ -111,6 +116,10 @@ export async function getSubmissionDetail(submissionId: string) {
     },
   })
   if (!submission) return null
+  // Your own work is not reviewable by you, so it is not visible here either.
+  // Null rather than a 403: the review surface should not confirm that this is
+  // a submission you merely lack rights over.
+  if (reviewerId && submission.themeProject.userId === reviewerId) return null
 
   const [breakdown, sessions, links, priorReviews] = await Promise.all([
     getHoursBreakdown(submission.themeProjectId, submission.phase, { live: false }),

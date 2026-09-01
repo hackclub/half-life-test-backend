@@ -33,6 +33,22 @@ twin. Its `lib/currency.ts` carries a long comment about the query that forgot:
 Having no reversal code path means there is no reversal code path to get wrong.
 `yarn verify:ledger` asserts the property end to end.
 
+## Credit mutations take a per-user advisory lock
+
+The balance is `SUM(amount)` over an append-only table, so there is no row a
+transaction can lock, and Postgres's default READ COMMITTED lets two concurrent
+transactions both read the same pre-existing balance and both commit. The first
+version of `purchase()` relied on `@@unique([shopOrderId, kind])` and was wrong:
+that constraint stops one order being charged twice, but two concurrent
+purchases mint two different order ids and collide with nothing. Eight parallel
+requests bought eight things with one balance.
+
+`lockUserCredit(tx, userId)` takes a `pg_advisory_xact_lock` as the first
+statement inside every transaction that reads a balance and then writes against
+it — purchase, refund, admin adjustment, and the review reconcile. It releases
+with the transaction, including on rollback. `scripts/verify-ledger.ts` fires
+eight concurrent purchases and asserts exactly one succeeds.
+
 ## Tiers are assigned at design approval
 
 The tier's dollars are parts money. A participant cannot buy components for a

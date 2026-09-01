@@ -10,13 +10,18 @@ export const dynamic = "force-dynamic"
 type Props = { searchParams: Promise<{ phase?: string; cursor?: string }> }
 
 export default async function ReviewQueuePage({ searchParams }: Props) {
-  await requirePermissionPage(Permission.REVIEW_SUBMISSIONS)
+  const { user } = await requirePermissionPage(Permission.REVIEW_SUBMISSIONS)
   const { phase, cursor } = await searchParams
 
   const selected =
     phase === "DESIGN" ? Phase.DESIGN : phase === "BUILD" ? Phase.BUILD : undefined
 
-  const queue = await getReviewQueue({ phase: selected, cursor, limit: 50 })
+  const queue = await getReviewQueue({
+    reviewerId: user.id,
+    phase: selected,
+    cursor,
+    limit: 50,
+  })
 
   return (
     <div className="hl-stack">

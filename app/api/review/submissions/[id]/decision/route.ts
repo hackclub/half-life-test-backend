@@ -1,7 +1,7 @@
 import { after } from "next/server"
-import { ok, parseBody, withRoute } from "@/lib/api"
+import { ok, fail, parseBody, withRoute } from "@/lib/api"
 import { requirePermission } from "@/lib/guards"
-import { Permission } from "@/lib/permissions"
+import { hasPermission, Permission } from "@/lib/permissions"
 import { decisionSchema } from "@/lib/schemas/review"
 import { sanitize, sanitizeOptional } from "@/lib/sanitize"
 import { finalizeReview } from "@/lib/review"
@@ -21,6 +21,17 @@ export const POST = withRoute(async (req: Request, { params }: Params) => {
   const parsed = await parseBody(req, decisionSchema)
   if (parsed.error) return parsed.error
   const body = parsed.data
+
+  // The tier table is the reviewer's whole vocabulary for funding. Writing a
+  // freehand dollar amount straight onto a grant row is an admin action —
+  // otherwise REVIEWER quietly carries the authority MANAGE_CREDIT withholds.
+  if (
+    "grantUsdOverride" in body &&
+    body.grantUsdOverride !== undefined &&
+    !hasPermission(gate.roles, Permission.MANAGE_CREDIT)
+  ) {
+    return fail("FORBIDDEN", "Overriding the grant amount requires the MANAGE_CREDIT permission")
+  }
 
   const outcome = await finalizeReview({
     submissionId: id,

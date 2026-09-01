@@ -3,7 +3,7 @@ import prisma from "@/lib/prisma"
 import { LedgerKind, ShopOrderStatus } from "@/app/generated/prisma/enums"
 import type { ShopItem, ShopOrder } from "@/app/generated/prisma/client"
 import { HttpError } from "@/lib/errors"
-import { appendLedgerEntry, getBalance } from "@/lib/currency"
+import { appendLedgerEntry, getBalance, lockUserCredit } from "@/lib/currency"
 import { getPrinterQualification } from "@/lib/printer"
 import { getShopAccess, SHOP_CLOSED_MESSAGE } from "@/lib/program"
 
@@ -60,9 +60,11 @@ export async function getShopItemsFor(userId: string): Promise<{
 /**
  * Buy something.
  *
- * The debit and the order are written in one transaction, and the ledger's
- * `@@unique([shopOrderId, kind])` means a double-submitted form collides
- * instead of charging twice.
+ * The whole thing runs under a per-user advisory lock. The ledger's
+ * `@@unique([shopOrderId, kind])` only stops one order being charged twice —
+ * two concurrent purchases mint two different order ids and collide with
+ * nothing, so without the lock ten parallel requests all read the same balance
+ * and all succeed.
  */
 export async function purchase(
   userId: string,
@@ -86,6 +88,8 @@ export async function purchase(
   }
 
   return prisma.$transaction(async (tx) => {
+    await lockUserCredit(tx, userId)
+
     // Re-read stock inside the transaction; the catalogue page may be stale.
     const fresh = await tx.shopItem.findUnique({ where: { id: shopItemId } })
     if (!fresh || !fresh.active) throw new HttpError("NOT_FOUND", "Item not found")
@@ -137,10 +141,13 @@ export async function purchase(
     })
 
     if (fresh.stock !== null) {
-      await tx.shopItem.update({
-        where: { id: shopItemId },
+      // Conditional, so stock cannot go negative even if two people buy the
+      // last unit at once — the loser's update matches nothing and rolls back.
+      const claimed = await tx.shopItem.updateMany({
+        where: { id: shopItemId, stock: { gte: quantity } },
         data: { stock: { decrement: quantity } },
       })
+      if (claimed.count !== 1) throw new HttpError("OUT_OF_STOCK", "Not enough stock left")
     }
 
     return order
@@ -159,7 +166,15 @@ export async function rejectOrder(
   adminId: string,
   reason: string,
 ): Promise<ShopOrder> {
+  const target = await prisma.shopOrder.findUnique({
+    where: { id: orderId },
+    select: { userId: true },
+  })
+  if (!target) throw new HttpError("NOT_FOUND", "Order not found")
+
   return prisma.$transaction(async (tx) => {
+    await lockUserCredit(tx, target.userId)
+
     const order = await tx.shopOrder.findUnique({ where: { id: orderId } })
     if (!order) throw new HttpError("NOT_FOUND", "Order not found")
     if (order.status !== ShopOrderStatus.PENDING && order.status !== ShopOrderStatus.ON_HOLD) {

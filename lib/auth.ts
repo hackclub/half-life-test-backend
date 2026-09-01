@@ -46,9 +46,16 @@ export const auth = betterAuth({
       // Without this, better-auth's link flow aborts with email_doesn't_match
       // and the account is never created — and because the auth handler
       // swallows the error into a dashboard redirect, it looks like the button
-      // simply did nothing.
+      // simply did nothing. This only affects the explicit linkSocial path,
+      // where the actor already holds the target session.
       allowDifferentEmails: true,
-      trustedProviders: ["hca", "hackatime"],
+      // ONLY hca. Marking a provider trusted waives better-auth's
+      // email-verification requirement when linking an OAuth identity onto an
+      // existing account by email match. Hackatime does not prove email
+      // ownership — our own getUserInfo hardcodes emailVerified: false — so
+      // trusting it would let anyone who registers a Hackatime account under
+      // someone else's address sign in as them.
+      trustedProviders: ["hca"],
     },
   },
 
@@ -98,11 +105,17 @@ export const auth = betterAuth({
 
           // The only way to get a first admin into a fresh database without
           // shell access to production.
+          //
+          // Gated on emailVerified, which only the identity provider can set:
+          // HCA passes through the OIDC email_verified claim, and every other
+          // provider we configure reports false. Without that check, anyone who
+          // claims a superadmin address on a provider that does not verify
+          // email would be granted ADMIN the moment they first signed in.
           const superadmins = (process.env.SUPERADMIN_EMAILS ?? "")
             .split(",")
             .map((s) => s.trim().toLowerCase())
             .filter(Boolean)
-          if (user.email && superadmins.includes(user.email.toLowerCase())) {
+          if (user.emailVerified && user.email && superadmins.includes(user.email.toLowerCase())) {
             await prisma.userRole
               .upsert({
                 where: { userId_role: { userId: user.id, role: Role.ADMIN } },
@@ -161,6 +174,14 @@ export const auth = betterAuth({
           clientSecret: process.env.HACKATIME_CLIENT_SECRET ?? "",
           scopes: ["profile"],
           pkce: true,
+          // Link-only. better-auth 1.7 registers generic OAuth providers as
+          // first-class social providers, so without this anyone could POST
+          // /api/auth/sign-in/social {"provider":"hackatime"} and mint a
+          // Half-Life account under an email Hackatime never verified —
+          // bypassing HCA identity entirely, and reaching the superadmin
+          // bootstrap below.
+          disableSignUp: true,
+          disableImplicitSignUp: true,
           getUserInfo: async ({ accessToken }) => {
             const base = process.env.HACKATIME_API_BASE ?? "https://hackatime.hackclub.com"
             const res = await fetch(`${base}/api/v1/authenticated/me`, {

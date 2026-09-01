@@ -4,7 +4,7 @@ import { requirePermission } from "@/lib/guards"
 import { Permission } from "@/lib/permissions"
 import { creditAdjustSchema } from "@/lib/schemas/admin"
 import { sanitize } from "@/lib/sanitize"
-import { appendLedgerEntry, getBalance, LedgerKind } from "@/lib/currency"
+import { appendLedgerEntry, getBalance, lockUserCredit, LedgerKind } from "@/lib/currency"
 import { AuditAction, logAudit } from "@/lib/audit"
 
 export const POST = withRoute(async (req: Request) => {
@@ -19,6 +19,7 @@ export const POST = withRoute(async (req: Request) => {
   if (!target) return fail("NOT_FOUND", "User not found")
 
   const entry = await prisma.$transaction(async (tx) => {
+    await lockUserCredit(tx, userId)
     const balance = await getBalance(tx, userId)
     // A negative balance is not a state the shop or any display knows how to
     // render, so refuse rather than create one.

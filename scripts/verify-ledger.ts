@@ -130,11 +130,71 @@ async function main() {
   check("printer qualification", qualification.qualified, true)
   check("themes shipped", qualification.shippedCount, 5)
 
+  // Nobody reviews their own work. Every account owns five themed projects, so
+  // without this a REVIEWER could approve their own design, set their own tier
+  // and mint their own credit.
+  const selfSubmission = await prisma.phaseSubmission.create({
+    data: { themeProjectId: project.id, phase: Phase.DESIGN },
+  })
+  let selfReviewRejected = false
+  try {
+    await finalizeReview({
+      submissionId: selfSubmission.id,
+      reviewerId: participant.id,
+      reviewerName: participant.name,
+      reviewerEmail: participant.email,
+      result: ReviewResult.APPROVED,
+      feedback: "Approving my own work.",
+      tier: 3,
+    })
+  } catch {
+    selfReviewRejected = true
+  }
+  check("self-review is refused", selfReviewRejected, true)
+
+  // The balance must be untouched by the attempt.
+  const afterSelfReview = await prisma.$transaction((tx) => getBalance(tx, participant.id))
+  check("self-review minted nothing", afterSelfReview, expectedTotal)
+
+  // Concurrent purchases must not double-spend. The balance is a SUM over an
+  // append-only table, so without a per-user lock ten parallel requests all
+  // read the same balance and all succeed.
+  const { purchase } = await import("../lib/shop")
+  await prisma.programSettings.update({
+    where: { id: "singleton" },
+    data: { shopOpen: true, shopClosesAt: null },
+  })
+  const item = await prisma.shopItem.create({
+    data: {
+      id: `ledger-check-item-${stamp}`,
+      name: "Ledger check widget",
+      description: "Costs exactly the participant's whole balance.",
+      priceCredits: expectedTotal,
+      maxPerUser: 0,
+      requiresPrinterQualified: false,
+    },
+  })
+
+  const attempts = await Promise.allSettled(
+    Array.from({ length: 8 }, () => purchase(participant.id, item.id, 1)),
+  )
+  const succeeded = attempts.filter((a) => a.status === "fulfilled").length
+  check("only one of eight concurrent purchases succeeds", succeeded, 1)
+
+  const afterPurchase = await prisma.$transaction((tx) => getBalance(tx, participant.id))
+  check("balance never goes negative", afterPurchase, 0)
+
   // Clean up so the script is re-runnable. Order matters: SubmissionReview
   // restricts deleting its reviewer, so the participant (whose projects cascade
   // down to those reviews) has to go first.
   await prisma.user.delete({ where: { id: participant.id } })
   await prisma.user.delete({ where: { id: reviewer.id } })
+  // The item can only go once the orders referencing it are gone with the user.
+  await prisma.shopItem.delete({ where: { id: item.id } })
+  await prisma.programSettings.update({
+    where: { id: "singleton" },
+    data: { shopOpen: false },
+  })
 
   console.log(failures === 0 ? "\nAll ledger checks passed." : `\n${failures} check(s) failed.`)
   process.exit(failures === 0 ? 0 : 1)

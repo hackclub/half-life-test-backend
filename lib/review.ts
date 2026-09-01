@@ -10,7 +10,7 @@ import {
 import type { Prisma } from "@/app/generated/prisma/client"
 import { HttpError } from "@/lib/errors"
 import { excessCreditFor, getHoursBreakdown } from "@/lib/hours"
-import { reconcileGrant } from "@/lib/currency"
+import { lockUserCredit, reconcileGrant } from "@/lib/currency"
 import { ensurePrinterAward } from "@/lib/printer"
 import { getTierOrThrow, isTierId } from "@/lib/config/tiers"
 import { THEME_COMPLETION_BONUS, getThemeDef } from "@/lib/config/program"
@@ -34,6 +34,15 @@ export async function claimSubmission(
   submissionId: string,
   reviewerId: string,
 ): Promise<ClaimResult> {
+  const owner = await prisma.phaseSubmission.findUnique({
+    where: { id: submissionId },
+    select: { themeProject: { select: { userId: true } } },
+  })
+  if (!owner) throw new HttpError("NOT_FOUND", "Submission not found")
+  if (owner.themeProject.userId === reviewerId) {
+    throw new HttpError("FORBIDDEN", "You cannot review your own submission")
+  }
+
   const settings = await getProgramSettings()
   const expiresAt = new Date(Date.now() + settings.reviewClaimTtlMinutes * 60_000)
 
@@ -120,6 +129,16 @@ export async function finalizeReview(input: FinalizeInput): Promise<FinalizeOutc
     include: { themeProject: { include: { user: { select: { id: true } } } }, claim: true },
   })
   if (!submission) throw new HttpError("NOT_FOUND", "Submission not found")
+
+  // Nobody reviews their own work. Every account gets its own five themed
+  // projects at signup, reviewers included, so without this a REVIEWER could
+  // approve their own design, set their own tier, and mint their own credit —
+  // which is exactly what the role is not supposed to be able to do. Admins are
+  // not exempt: the point is a second pair of eyes, not a trust level.
+  if (submission.themeProject.userId === input.reviewerId) {
+    throw new HttpError("FORBIDDEN", "You cannot review your own submission")
+  }
+
   if (submission.resolvedAt) {
     throw new HttpError("ALREADY_RESOLVED", "This submission has already been decided")
   }
@@ -188,6 +207,10 @@ export async function finalizeReview(input: FinalizeInput): Promise<FinalizeOutc
         : PhaseStatus.rejected
 
   const outcome = await prisma.$transaction(async (tx) => {
+    // reconcileGrant reads a running sum and writes a delta against it, so it
+    // needs the same serialization the shop does.
+    await lockUserCredit(tx, project.userId)
+
     // Re-read inside the transaction: the review page may have been open for a
     // while, and the participant may have withdrawn in the meantime.
     const fresh = await tx.phaseSubmission.findUnique({
@@ -352,6 +375,8 @@ export async function unapprovePhase(
   }
 
   await prisma.$transaction(async (tx) => {
+    await lockUserCredit(tx, project.userId)
+
     await tx.submissionReview.updateMany({
       where: { submission: { themeProjectId, phase }, invalidated: false },
       data: { invalidated: true, invalidatedAt: new Date() },

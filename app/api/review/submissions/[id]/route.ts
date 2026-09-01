@@ -12,7 +12,7 @@ export const GET = withRoute(async (_req: Request, { params }: Params) => {
   if (gate.error) return gate.error
   const { id } = await params
 
-  const detail = await getSubmissionDetail(id)
+  const detail = await getSubmissionDetail(id, gate.user.id)
   if (!detail) return fail("NOT_FOUND", "Submission not found")
   return ok(detail)
 })

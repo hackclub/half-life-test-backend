@@ -26,13 +26,32 @@ export function middleware(request: NextRequest) {
   if (process.env.REQUIRE_BASICAUTH === "true") {
     const expectedUser = process.env.BASICAUTH_USERNAME
     const expectedPass = process.env.BASICAUTH_PASSWORD
-    if (expectedUser && expectedPass) {
-      const header = request.headers.get("authorization") ?? ""
-      const [scheme, encoded] = header.split(" ")
-      if (scheme !== "Basic" || !encoded) return unauthorized()
-      const [user, pass] = atob(encoded).split(":")
-      if (user !== expectedUser || pass !== expectedPass) return unauthorized()
+
+    // Fail closed. An enabled gate with missing credentials used to fall
+    // through and serve the site, which is the exact opposite of what the
+    // operator who flipped the flag asked for.
+    if (!expectedUser || !expectedPass) {
+      return new NextResponse(
+        "Basic auth is enabled but BASICAUTH_USERNAME/BASICAUTH_PASSWORD are not set",
+        { status: 503 },
+      )
     }
+
+    const header = request.headers.get("authorization") ?? ""
+    const [scheme, encoded] = header.split(" ")
+    if (scheme !== "Basic" || !encoded) return unauthorized()
+
+    let decoded: string
+    try {
+      decoded = atob(encoded)
+    } catch {
+      // A non-base64 payload would otherwise throw and surface as a 500.
+      return unauthorized()
+    }
+    const separator = decoded.indexOf(":")
+    const user = separator === -1 ? decoded : decoded.slice(0, separator)
+    const pass = separator === -1 ? "" : decoded.slice(separator + 1)
+    if (user !== expectedUser || pass !== expectedPass) return unauthorized()
   }
 
   return securityHeaders(NextResponse.next())

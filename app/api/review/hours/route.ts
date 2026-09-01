@@ -1,5 +1,5 @@
 import prisma from "@/lib/prisma"
-import { ok, parseBody, withRoute } from "@/lib/api"
+import { ok, fail, parseBody, withRoute } from "@/lib/api"
 import { requirePermission } from "@/lib/guards"
 import { Permission } from "@/lib/permissions"
 import { hoursDecisionSchema } from "@/lib/schemas/review"
@@ -16,6 +16,26 @@ export const POST = withRoute(async (req: Request) => {
 
   const parsed = await parseBody(req, hoursDecisionSchema)
   if (parsed.error) return parsed.error
+
+  // Approving hours is the other half of the money path, so it needs the same
+  // rule the decision route has: nobody rules on their own work.
+  const sessionIds = parsed.data.decisions.filter((d) => d.kind === "session").map((d) => d.id)
+  const linkIds = parsed.data.decisions.filter((d) => d.kind === "hackatime").map((d) => d.id)
+  const [ownSessions, ownLinks] = await Promise.all([
+    sessionIds.length
+      ? prisma.workSession.count({
+          where: { id: { in: sessionIds }, themeProject: { userId: gate.user.id } },
+        })
+      : 0,
+    linkIds.length
+      ? prisma.hackatimeLink.count({
+          where: { id: { in: linkIds }, themeProject: { userId: gate.user.id } },
+        })
+      : 0,
+  ])
+  if (ownSessions > 0 || ownLinks > 0) {
+    return fail("FORBIDDEN", "You cannot approve hours on your own work")
+  }
 
   const now = new Date()
   const applied = await prisma.$transaction(async (tx) => {

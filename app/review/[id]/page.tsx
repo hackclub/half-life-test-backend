@@ -26,7 +26,7 @@ export default async function ReviewDetailPage({ params }: Props) {
   const { user } = await requirePermissionPage(Permission.REVIEW_SUBMISSIONS)
   const { id } = await params
 
-  const detail = await getSubmissionDetail(id)
+  const detail = await getSubmissionDetail(id, user.id)
   if (!detail) notFound()
 
   const { submission, breakdown, claimLive } = detail

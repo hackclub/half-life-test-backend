@@ -63,10 +63,34 @@ unconfigured.
   bespoke reversal path.
 - Balance is always `SUM(amount)`. `balanceBefore`/`balanceAfter` are an audit
   aid; if they ever disagree with the sum, a write escaped its transaction.
+- **Every transaction that reads a balance and then writes against it must call
+  `lockUserCredit(tx, userId)` first.** Because the balance is an aggregate over
+  an append-only table there is no row to lock, and READ COMMITTED lets two
+  concurrent requests both read the same balance and both commit — a real
+  double-spend, with physical goods on the other side. The
+  `@@unique([shopOrderId, kind])` constraint does not help: two concurrent
+  purchases mint two different order ids.
 - Soft delete via `deletedAt`. Every read filters `deletedAt: null`.
 - Sanitize free text: `sanitize()` for plain text, `sanitizeHtml()` for journal
   content. Zod checks shape, DOMPurify checks content; neither substitutes.
 - Pagination is cursor-based, ordered by a compound key ending in `id`.
+
+## Review integrity
+
+- **Nobody reviews their own work.** Every account owns five themed projects,
+  reviewers included, so this is not an edge case. `claimSubmission` and
+  `finalizeReview` refuse it, `POST /api/review/hours` refuses it, and the queue
+  and detail queries filter it out. Admins are not exempt — the point is a
+  second pair of eyes, not a trust level.
+- `grantUsdOverride` requires `MANAGE_CREDIT`. The tier table is a reviewer's
+  whole vocabulary for funding; a freehand dollar amount on a grant row is an
+  admin action.
+- **Hackatime is link-only** (`disableSignUp`, `disableImplicitSignUp`, and not
+  in `trustedProviders`). It does not verify email ownership, so allowing it as
+  a sign-in identity would let anyone who registers a Hackatime account under
+  someone else's address sign in as them. HCA is the only identity provider.
+- The `SUPERADMIN_EMAILS` bootstrap only fires for an account whose email the
+  identity provider actually verified.
 
 ## Hours
 
