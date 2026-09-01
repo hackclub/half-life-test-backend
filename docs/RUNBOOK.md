@@ -55,7 +55,20 @@ Coolify.
    ```
 
    Watch `get_build_logs`. Set `REQUIRE_BASICAUTH=true` plus
-   `BASICAUTH_USERNAME`/`BASICAUTH_PASSWORD` until launch day.
+   `BASICAUTH_USERNAME`/`BASICAUTH_PASSWORD` until launch day — the gate now
+   503s rather than serving if the flag is on and either credential is blank.
+
+   **Changing an env var later: use `add_env_vars`, not `set_env_vars`.**
+   `set_env_vars` replaces the entire set, so anything you leave out is deleted;
+   `add_env_vars` merges. Both restart the deployment.
+
+   `DATABASE_URL` is the only database setting. Prisma 7 dropped the `url =`
+   line from `schema.prisma`, so the CLI reads it from `prisma.config.ts` and
+   the runtime reads it from the driver adapter in `lib/prisma.ts` — both off
+   `process.env.DATABASE_URL`. **Never set `SHADOW_DATABASE_URL` in
+   production**: `prisma migrate deploy` refuses to run when the shadow URL
+   equals the main one, and the pod crashloops at boot. It exists for the CI
+   schema-vs-migrations check and nowhere else.
 
 7. **Create the ingress** — `create_ingress` for `half-life.k.hackclub.dev`.
    Orchard already terminates TLS for that domain, so no `validate_dns` step is
