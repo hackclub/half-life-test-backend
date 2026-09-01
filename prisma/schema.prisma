@@ -255,7 +255,15 @@ model Session {
 }
 
 model Account {
-  id                    String    @id
+  id String @id
+
+  /// The provider's stable issuer identity. better-auth keys accounts on
+  /// (issuer, accountId), NOT on (providerId, accountId): providerId is our
+  /// local label for a provider, while the issuer is what the provider itself
+  /// asserts, so it is the half that actually identifies an upstream account.
+  /// Required by better-auth >= 1.7 — without it every sign-in fails inside
+  /// findAccountOwnerByKey.
+  issuer                String
   accountId             String
   providerId            String
   userId                String
@@ -270,10 +278,10 @@ model Account {
   createdAt             DateTime  @default(now())
   updatedAt             DateTime  @updatedAt
 
-  /// Without this, a retried OAuth callback can create two rows for the same
-  /// upstream identity, and "find this user's HCA account" becomes
-  /// nondeterministic about which refresh token it picks up.
-  @@unique([providerId, accountId])
+  /// Matches better-auth's own index. Without it a retried OAuth callback can
+  /// create two rows for the same upstream identity, and "find this user's HCA
+  /// account" becomes nondeterministic about which refresh token it picks up.
+  @@unique([issuer, accountId])
   @@index([userId])
   @@map("account")
 }
