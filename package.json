@@ -26,7 +26,7 @@
     "@prisma/client": "^7.10.0",
     "better-auth": "^1.7.2",
     "isomorphic-dompurify": "^2.35.0",
-    "next": "^16.3.4",
+    "next": "^16.3.8",
     "prisma": "^7.10.0",
     "react": "19.2.8",
     "react-dom": "19.2.8",
